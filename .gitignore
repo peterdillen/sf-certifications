@@ -24,6 +24,11 @@
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+*.png
+worker_debug_*
+debug_topic_*
+test_api.js
+research_scraper.js
 
 # local env files
 .env*.local
