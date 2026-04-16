@@ -4,6 +4,9 @@ const nextConfig = {
         serverComponentsExternalPackages: ['sqlite3'],
         outputFileTracingExcludes: {
             '*': ['node_modules/sqlite3/**/*']
+        },
+        outputFileTracingIncludes: {
+            '/api/**/*': ['./trailblazer*.db']
         }
     },
 };

@@ -23,9 +23,23 @@ export default function ComparePage() {
         try {
             const res = await fetch('/api/trailblazers');
             const result = await res.json();
-            setData(result);
+            
+            if (!res.ok) {
+                console.error('API Error:', result);
+                showToast(result.error || 'Failed to fetch trailblazers');
+                setData({ trailblazers: [], certifications: [], relationships: [] });
+                return;
+            }
+            
+            setData({
+                trailblazers: result.trailblazers || [],
+                certifications: result.certifications || [],
+                relationships: result.relationships || []
+            });
         } catch (err) {
             console.error('Failed to fetch data', err);
+            setData({ trailblazers: [], certifications: [], relationships: [] });
+            showToast('Failed to fetch data (Server Error)');
         } finally {
             setLoading(false);
         }

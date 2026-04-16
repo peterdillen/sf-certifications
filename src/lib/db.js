@@ -1,9 +1,27 @@
 import path from 'path';
+import fs from 'fs';
 
 let sqlite3; // Lazy loaded
 
 const isDev = process.env.NODE_ENV === 'development';
-const dbPath = path.join(process.cwd(), isDev ? 'trailblazer_dev.db' : 'trailblazer.db');
+let dbPath = path.join(process.cwd(), isDev ? 'trailblazer_dev.db' : 'trailblazer.db');
+
+if (process.env.VERCEL) {
+    const tmpPath = path.join('/tmp', path.basename(dbPath));
+    try {
+        if (!fs.existsSync(tmpPath)) {
+            if (fs.existsSync(dbPath)) {
+                fs.copyFileSync(dbPath, tmpPath);
+                console.log('[DB] Copied DB to /tmp for Vercel writable access');
+            } else {
+                console.log('[DB] Source DB not found, a new one will be created in /tmp');
+            }
+        }
+        dbPath = tmpPath;
+    } catch (e) {
+        console.error('[DB] Error configuring /tmp DB path:', e);
+    }
+}
 
 // Use a global to avoid multiple connections and re-init in dev mode (HMR)
 let db;
