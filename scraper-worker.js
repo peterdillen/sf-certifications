@@ -56,21 +56,27 @@ async function scrape(userAlias) {
         await new Promise(r => setTimeout(r, 2000));
         const isPrivate = await page.evaluate(() => {
             const bodyText = document.body.innerText;
-            if (bodyText.includes('This profile is private')) return true;
-            // Check shadow roots if needed
-            function findTextInShadow(root = document) {
-                if (root.innerText && root.innerText.includes('This profile is private')) return true;
-                const children = Array.from(root.querySelectorAll('*'));
-                for (const child of children) {
-                    if (child.shadowRoot && findTextInShadow(child.shadowRoot)) return true;
-                }
-                return false;
-            }
-            return findTextInShadow();
+            const html = document.documentElement.innerHTML;
+            const privateTexts = [
+                'profile is private',
+                'set their profile to private',
+                'isn\'t public',
+                'doesn\'t have a public profile',
+                'profile is not public'
+            ];
+            const hasPrivateText = privateTexts.some(text =>
+                bodyText.toLowerCase().includes(text.toLowerCase()) ||
+                html.toLowerCase().includes(text.toLowerCase())
+            );
+
+            // Fallback: If name exists but certain public-only sections are missing
+            const hasCertsSection = html.includes('Certifications') || html.includes('credentials-topic');
+            return hasPrivateText || (bodyText.length > 0 && !hasCertsSection);
         });
+
         if (isPrivate) {
             console.error('Detected private profile');
-            return { error: 'Profile is private' };
+            return { error: 'PRIVATE_PROFILE', name: title.replace(' - Trailblazer Profile', '').trim() || userAlias };
         }
 
         // Wait for certifications section
@@ -91,17 +97,16 @@ async function scrape(userAlias) {
             }
 
             console.log('Searching for topics...');
-            const buttons = findAllInShadow('button, div[role="button"]');
-            console.log(`Found ${buttons.length} total clickable elements (including Shadow DOM)`);
+            const potentialTopics = findAllInShadow('button, div[role="button"], h2.title, h2, h3');
+            console.log(`Found ${potentialTopics.length} potential topic elements`);
 
-            const topicInfo = buttons.map(btn => {
-                const rect = btn.getBoundingClientRect();
-                const text = btn.innerText || '';
-                const ariaLabel = btn.getAttribute('aria-label') || '';
+            const topicInfo = potentialTopics.map(el => {
+                const rect = el.getBoundingClientRect();
+                const text = el.innerText || '';
+                const ariaLabel = el.getAttribute('aria-label') || '';
                 const combinedText = (text + ' ' + ariaLabel).toLowerCase();
 
-                // Identify topic buttons: they usually have "certifications" or are under a section with that name
-                // Or they might just be the accordion headers
+                // Identify topic buttons or headers: they usually have "certifications"
                 const isCertTopic = combinedText.includes('certifications') &&
                     (rect.width > 0 && rect.height > 0);
 
@@ -111,11 +116,13 @@ async function scrape(userAlias) {
                     ariaLabel: ariaLabel,
                     x: rect.left + rect.width / 2,
                     y: rect.top + rect.height / 2,
-                    isCert: isCertTopic
+                    isCert: isCertTopic,
+                    isButton: el.tagName === 'BUTTON' || el.getAttribute('role') === 'button',
+                    isExpanded: el.getAttribute('aria-expanded') === 'true' || el.classList.contains('slds-is-open')
                 };
             }).filter(info => info.isCert);
 
-            console.log(`Found ${topicInfo.length} certification topic buttons`);
+            console.log(`Found ${topicInfo.length} certification topic elements`);
             return topicInfo;
         });
 
@@ -123,7 +130,93 @@ async function scrape(userAlias) {
 
         // Sorting topics by Y to handle them in order
         const sortedTopics = certifications.sort((a, b) => a.y - b.y);
-        const finalResults = [];
+        // Helper for Shadow DOM
+        const findOneInShadow = async (selector) => {
+            return await page.evaluate((sel) => {
+                function findOne(root, targetSel) {
+                    const el = root.querySelector(targetSel);
+                    if (el) return el;
+                    const all = root.querySelectorAll('*');
+                    for (const child of all) {
+                        if (child.shadowRoot) {
+                            const found = findOne(child.shadowRoot, targetSel);
+                            if (found) return found;
+                        }
+                    }
+                    return null;
+                }
+                const found = findOne(document, sel);
+                return found ? found.innerText : null;
+            }, selector);
+        };
+
+        // Get Profile Data
+        const profileData = await page.evaluate(() => {
+            function find(root, sel) {
+                const el = root.querySelector(sel);
+                if (el) return el;
+                const all = root.querySelectorAll('*');
+                for (const child of all) {
+                    if (child.shadowRoot) {
+                        const found = find(child.shadowRoot, sel);
+                        if (found) return found;
+                    }
+                }
+                return null;
+            }
+
+            // Try to find the global profile object or extract it from script tags
+            let profile = window.profile;
+            if (!profile) {
+                const scripts = Array.from(document.querySelectorAll('script'));
+                const profileScript = scripts.find(s => s.innerText.includes('var profile = {'));
+                if (profileScript) {
+                    try {
+                        const match = profileScript.innerText.match(/var profile = (\{.*?\});/s);
+                        if (match) {
+                            profile = JSON.parse(match[1]);
+                        }
+                    } catch (e) {
+                        console.error('Failed to parse profile JSON from script:', e);
+                    }
+                }
+            }
+
+            const nameEl = find(document, 'h1.slds-text-heading_large') || find(document, 'h1') || find(document, '.slds-media__body h1');
+            const avatarEl = find(document, 'span.tds-avatar img') || find(document, 'img[src*="profile-photo"]') || find(document, 'img.slds-avatar');
+
+            return {
+                name: profile?.firstName ? `${profile.firstName} ${profile.lastName}` : (nameEl ? nameEl.innerText.split('|')[0].trim() : null),
+                picture: profile?.photoUrl || (avatarEl ? avatarEl.src : null),
+                username: profile?.username || null,
+                profileUrl: profile?.profileUrl || null
+            };
+        });
+
+        const content = await page.content();
+        let nickname = profileData.username;
+        if (!nickname) {
+            // Priority 1: username (usually the vanity part)
+            const usernameMatch = content.match(/"username"\s*:\s*"([^"]+)"/);
+            if (usernameMatch) {
+                nickname = usernameMatch[1];
+            } else {
+                // Priority 2: nickname (fallback)
+                const nicknameMatch = content.match(/"nickname"\s*:\s*"([^"]+)"/);
+                nickname = nicknameMatch ? nicknameMatch[1] : null;
+            }
+        }
+
+        const fullName = profileData.name || (await page.title()).split(' - ')[0].trim();
+        const profilePictureUrl = profileData.picture;
+        const profileUrl = profileData.profileUrl || (nickname ? `https://www.salesforce.com/trailblazer/${nickname}` : `https://www.salesforce.com/trailblazer/${alias}`);
+
+        const results = {
+            name: fullName,
+            picture: profilePictureUrl,
+            profileUrl: profileUrl,
+            certifications: []
+        };
 
         for (let i = 0; i < certifications.length; i++) {
             const topicName = certifications[i].text;
@@ -141,20 +234,22 @@ async function scrape(userAlias) {
                     }
                     return elements;
                 }
-                const buttons = findAllInShadow('button, div[role="button"]');
-                // Target button more precisely: must contain topic text AND certifications count
-                const btn = buttons.find(b => {
+                const potential = findAllInShadow('button, div[role="button"], h2.title, h2, h3');
+                // Target item more precisely: must contain topic text
+                const el = potential.find(b => {
                     const t = (b.innerText || '').toLowerCase();
-                    return t.includes(targetText.toLowerCase()) && t.includes('certifications');
+                    return t.includes(targetText.toLowerCase());
                 });
-                if (!btn) return null;
+                if (!el) return null;
 
-                btn.scrollIntoView({ behavior: 'instant', block: 'center' });
-                const rect = btn.getBoundingClientRect();
+                el.scrollIntoView({ behavior: 'instant', block: 'center' });
+                const rect = el.getBoundingClientRect();
+                const isButton = el.tagName === 'BUTTON' || el.getAttribute('role') === 'button';
                 return {
                     x: rect.left + rect.width / 2,
                     y: rect.top + rect.height / 2,
-                    isExpanded: btn.getAttribute('aria-expanded') === 'true' || btn.classList.contains('slds-is-open')
+                    isButton: isButton,
+                    isExpanded: !isButton || el.getAttribute('aria-expanded') === 'true' || el.classList.contains('slds-is-open')
                 };
             }, topicName);
 
@@ -229,49 +324,109 @@ async function scrape(userAlias) {
                     const text = (node.innerText || '').trim();
                     if (text.length < 10 || text.length > 500) return;
 
-                    const dateMatch = text.match(/(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}/);
+                    // Support date ranges: "Oct 2018 - Apr 2019"
+                    const dateMatch = text.match(/(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}(\s*-\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4})?/i);
 
                     if (dateMatch) {
                         const rect = node.getBoundingClientRect();
                         const midY = rect.top + rect.height / 2;
 
                         if (midY > minY && midY < maxY) {
-                            let name = '';
+                            let link = '';
                             // Priority: find a link or header that IS NOT the topic name or 'Issued...'
                             const possibleTitleElems = Array.from(node.querySelectorAll('a, h3, h4, b, [class*="title"]'));
                             const bestTitleElem = possibleTitleElems.find(el => {
                                 const t = el.innerText.trim();
                                 return t.length > 5 &&
                                     !t.toLowerCase().includes('issued') &&
+                                    !t.toLowerCase().includes('achieved by') &&
                                     t.toLowerCase() !== targetTopicName.toLowerCase();
                             });
 
                             if (bestTitleElem) {
                                 name = bestTitleElem.innerText.trim();
+
+                                // Look for any <a> with trailheadacademy link in the whole node
+                                const allLinks = Array.from(node.querySelectorAll('a'));
+                                const certLinkElem = allLinks.find(a =>
+                                    a.href && a.href.toLowerCase().includes('trailheadacademy.salesforce.com/certificate')
+                                );
+                                if (certLinkElem) {
+                                    link = certLinkElem.href;
+                                } else {
+                                    const linkElem = bestTitleElem.tagName === 'A' ? bestTitleElem : bestTitleElem.querySelector('a');
+                                    if (linkElem) link = linkElem.href;
+                                }
                             } else {
                                 const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 5);
-                                name = lines.find(l => !l.includes(dateMatch[0]) &&
-                                    !l.toLowerCase().includes('issued') &&
-                                    l.toLowerCase() !== targetTopicName.toLowerCase()) || lines[0];
+                                name = lines.find(l => {
+                                    const lower = l.toLowerCase();
+                                    return !lower.match(/(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}/i) &&
+                                        !lower.includes('issued') &&
+                                        !lower.includes('achieved by') &&
+                                        lower !== targetTopicName.toLowerCase();
+                                }) || lines[0];
                             }
 
                             if (name && name.length > 5 && name.length < 100) {
                                 // Clean name from common noise and metadata
-                                let cleanName = name.replace(/^(Virtual|In-person|Online|Specialist|Issued|Achieved)\s*(•|:)?\s*/i, '').trim();
+                                let cleanName = name.replace(/^(Virtual|In-person|Online|Specialist|Issued|Achieved|Achieved by)\s*(•|:)?\s*/i, '').trim();
+
+                                // Explicitly filter out nodes that are JUST dates
+                                const isJustDate = cleanName.match(/^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}(\s*-\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4})?$/i);
 
                                 // Explicitly filter out noise
                                 const noisePatterns = [/TrailblazerDX/i, /World Tour/i, /Dreamforce/i];
                                 const isNoise = noisePatterns.some(p => p.test(cleanName));
 
-                                if (!isNoise &&
+                                if (!isNoise && !isJustDate &&
                                     cleanName.toLowerCase() !== targetTopicName.toLowerCase() &&
                                     !cleanName.toLowerCase().startsWith('issued') &&
-                                    !cleanName.match(/^(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}$/i) &&
                                     cleanName.length > 5) {
 
-                                    const key = `${cleanName}|${dateMatch[0]}`;
+                                    // Determine if expired
+                                    let isExpired = false;
+                                    const fullDateStr = dateMatch[0];
+                                    if (fullDateStr.includes('-')) {
+                                        const parts = fullDateStr.split('-').map(p => p.trim());
+                                        const endDateStr = parts[1];
+                                        const now = new Date();
+                                        const endDate = new Date(endDateStr);
+                                        if (endDate < now) {
+                                            isExpired = true;
+                                        }
+                                    }
+
+                                    const key = `${targetTopicName}|${cleanName}`;
                                     if (!seen.has(key)) {
-                                        certResults.push({ topic: targetTopicName, name: cleanName, date: dateMatch[0] });
+                                        // Extract description if possible
+                                        const fullNodeTextLines = text.split('\n').map(l => l.trim()).filter(l => l.length > 5);
+                                        const desc = fullNodeTextLines.find(l =>
+                                            l !== name &&
+                                            !l.match(/(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{4}/i) &&
+                                            !l.includes('Achieved by') &&
+                                            !l.includes('Issued')
+                                        ) || '';
+
+                                        // Extract image if possible
+                                        const img = node.querySelector('img');
+                                        const imageUrl = img ? img.src : '';
+
+                                        // Normalize name
+                                        const normalizedName = cleanName
+                                            .replace(/^Salesforce Certified\s+/i, '')
+                                            .replace(/Accredited Professional/gi, '(Accreditation)')
+                                            .trim();
+
+                                        certResults.push({
+                                            topic: targetTopicName,
+                                            name: normalizedName,
+                                            description: desc,
+                                            image: imageUrl,
+                                            date: fullDateStr,
+                                            isExpired: isExpired,
+                                            link: link
+                                        });
                                         seen.add(key);
                                     }
                                 }
@@ -287,13 +442,13 @@ async function scrape(userAlias) {
                 console.error(`No results found for topic: ${topicName}`);
             }
 
-            finalResults.push(...pageData);
+            results.certifications.push(...pageData);
         }
 
         await page.screenshot({ path: 'worker_debug_final_state.png', fullPage: true });
         console.error('Final state screenshot saved');
 
-        return { certifications: finalResults };
+        return results;
 
     } catch (error) {
         return { error: error.message };
@@ -312,5 +467,6 @@ if (require.main === module) {
 
     scrape(alias).then(result => {
         console.log(JSON.stringify(result));
+        process.exit(0);
     });
 }
